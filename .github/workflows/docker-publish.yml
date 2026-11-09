@@ -1,0 +1,197 @@
+name: ci / docker publish
+
+# Build the Odysseus image and publish to GHCR.
+#   push to main -> :latest, :X.Y.Z            (curated release; main is fast-forwarded at releases)
+#   push to dev  -> :dev,    :X.Y.Z-dev.<sha>  (rolling dev + an immutable, traceable pin)
+# Multi-arch (linux/amd64 + linux/arm64): each arch builds on its own native
+# runner and pushes by digest, then a merge job stitches the digests into one
+# manifest list and applies the tags (faster + cleaner than QEMU emulation).
+# Registry: ghcr.io/<owner>/<repo>.
+
+on:
+  push:
+    branches: [dev, main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} image
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push architecture image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Save image digest
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          case "$digest" in
+            sha256:*) ;;
+            *)
+              echo "::error::Build did not produce an image digest"
+              exit 1
+              ;;
+          esac
+          mkdir -p "${{ runner.temp }}/digests"
+          printf '%s\n' "${digest#sha256:}" > "${{ runner.temp }}/digests/digest-${{ matrix.arch }}"
+
+      - name: Upload architecture digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and publish multi-arch manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read application version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' src/constants.py | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::APP_VERSION is empty or missing in src/constants.py"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Verify downloaded digests
+        run: |
+          set -euo pipefail
+          digest_count="$(find "${{ runner.temp }}/digests" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')"
+          if [ "$digest_count" -ne 2 ]; then
+            echo "::error::Expected two architecture digests, found ${digest_count}"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          if [ -z "$short_sha" ]; then
+            echo "::error::Unable to determine the short commit identifier"
+            exit 1
+          fi
+          version="${{ steps.version.outputs.version }}"
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            {
+              echo "tags<<EOF"
+              echo "${image}:latest"
+              echo "${image}:${version}"
+              echo "EOF"
+              echo "floating_tag=latest"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags<<EOF"
+              echo "${image}:dev"
+              echo "${image}:${version}-dev.${short_sha}"
+              echo "EOF"
+              echo "floating_tag=dev"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish multi-arch manifest
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest_file in "${{ runner.temp }}"/digests/*; do
+            digest="$(tr -d '[:space:]' < "$digest_file")"
+            if ! printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::Invalid digest in ${digest_file}"
+              exit 1
+            fi
+            sources+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${digest}")
+          done
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "::error::No architecture digests available"
+            exit 1
+          fi
+          tag_args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done <<< "${{ steps.tags.outputs.tags }}"
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+
+      - name: Inspect published manifest
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.floating_tag }}"
